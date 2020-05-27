@@ -1,0 +1,652 @@
+/* Имя: usbdrv.h
+* Проект: драйвер AVR USB
+* Автор: Christian Starkjohann
+* Перевод: microsin.ru
+* Дата создания: 2004-12-29
+* Табуляция: 4
+* Copyright: (c) 2005 by OBJECTIVE DEVELOPMENT Software GmbH
+* Лицензия: GNU GPL v2 (see License.txt) or proprietary (CommercialLicense.txt)
+* Ревизия: $Id: usbdrv.h 607 2008-05-13 15:57:28Z cs $
+*/
+#ifndef __usbdrv_h_included__
+#define __usbdrv_h_included__
+#include "usbconfig.h"
+#include "iarcompat.h"
+/*
+Требования к железу:
+====================
+Сигналы USB D+ и D- ДОЛЖНЫ быть подсоединены на один и тот же I/O порт (A, B, C или D).
+Мы рекомендуем, чтобы сигнал D+ вызывал прерывание (лучший выбор - использовать INT0
+для D+), однако возможно, чтобы прерывание срабатывало не от D+, а от D-. Если
+используется D-, прерывания будут происходить каждый раз при получении пакетов SOF
+(Start-Of-Frame). D- требует нагрузочный (pull-up) резистор 1.5k, подключенный к +3.5V
+(и устройство должно быть запитано от 3.5V) для идентификации USB устройства как
+low-speed. Резистор pull-down или pull-up 1M ДОЛЖЕН быть SHOULD подсоединен между D+
+и +3.5V для предотвращения помех, конгда отсутствует USB мастер. Если Вы используете
+диоды Зенера (по-русски - стабилитроны) для ограничения напряжения на сигналах D+ и D-,
+Вы должны использовать резистор pull-down, а не pull-up. Мы используем D+ как источник
+прерывания, не D-, потому что он не вызывает прерывание на состояния keep-alive
+и RESET. Если Вы хотите подсчитывать события keep-alive с USB_COUNT_SOF, Вы ДОЛЖНЫ
+использовать D- как источник прерываний.
+Как опция этапа компиляции, 1.5k pull-up резистор на D- можнос сделать отключаемым,
+чтобы реализовать программное отключение устройства от шины USB. См. установки
+usbDeviceConnect() и usbDeviceDisconnect() далее в этом файле.
+Пожалуйста, приведите величины в файле usbconfig.h в соответствие Вашему железу!
+Микроконтроллер в Вашем USB-устройстве ДОЛЖЕН тактироваться от частот 12, 15 или 16 МГц
+(при использовании кварца) или 16.5 МГц (использование внутреннего RC-генератора,
+точность частоты +/- 1%). Детали см. в usbconfig-prototype.h.
+Ограничения:
+============
+Устойчивость к ошибкам в коммуникации:
+Драйвер предполагает, что при передаче данных ошибки отсутствуют. Он ДЕЛАЕТ проверку
+ошибок в PID, но НЕ проверяет ошибки вставки битов, SE0 в середине байта,
+CRC токена (5 бит) и CRC данных (16 бит). Проверки CRC не могут быть выполнены из-за
+ограничений по времени: мы должны начать отправку ответа внутри 7-битного интервала
+времени. Битовые ошибки и неправильно вставленный SE0 по спецификации должны проверяться
+в режиме реального времени, но возможности универсального CPU AVR не допускают это.
+Драйвер не проверяет переключение Data0/Data1, но приложение, с которым работает драйвер,
+может реализовать такую проверку.
+Входные характеристики:
+Поскольку используется схема недифференциального приемника, чуствительность
+к электрическим помехам повышенная. Драйвер опрашивает только одну линию ъ
+данных с обычными входными характеристиками ножки I/O. Однако поскольку здесь
+реализована низкоскоростная спецификация USB, то возможностей AVR оказывается
+достаточно. Также спецификация требует обнаружения асимметрических состояний
+на высоких скоростях для обнаружения SE0.
+Количество конечных точек:
+Драйвер поддерживает следующие конечные точки:
+- Endpoint 0, по умолчанию управляющая конечная точка (default control endpoint).
+- Любое количество interrupt- или bulk-out конечных точек. Данные передаются
+в usbFunctionWriteOut() и USB_CFG_IMPLEMENT_FN_WRITEOUT должен быть задан
+в 1 для активирования этой возможности. Номер конечной точки может быть
+найден в глобальной переменной 'usbRxToken'.
+- По умолчанию одна interrupt- или bulk-in конечная точка. Эта конечная точка
+используется для interrupt- или bulk-in передач, которые не обрабатываются
+другой конечной точкой. Вы можете задать USB_CFG_HAVE_INTRIN_ENDPOINT в порядке
+активирования этой возможности и вызвать usbSetInterrupt() для отправки
+данных interrupt/bulk.
+- Одна добавочная interrupt- или bulk-in конечная точка. Это была endpoint 3 в
+предыдущих версиях этого драйвера, но можно сконфигурировать любой номер
+конечной точки. Вы должны задать USB_CFG_HAVE_INTRIN_ENDPOINT3 для активации
+этой возможности и вызвать usbSetInterrupt3() для отправки данных interrupt/bulk.
+Номер конечной точки указывается в USB_CFG_EP3_NUMBER.
+Пожалуйста примите во внимание, что стандарт USB запрещает конечные точки bulk
+для низкоскоростных устройств! Многие операционные системы однако все равно
+разрешают использовать их, но AVR тратит 90% времени CPU в опросах прерываний
+USB для данных bulk.
+Максимальная полезная нагрузка данными:
+Загрузка данными для управляющих входных (control in) и выходных (out) передач
+может достигать до 254 байт. Чтобы принять данные полезной нагрузки выходных
+передач (out transfers), Вы должны реализовать 'usbFunctionWrite()'.
+Потребление тока в режиме USB Suspend Mode:
+Стандарт USB ограничивает энергопотребление величиной 500uA, когда шина
+переходит в режим suspend mode. Это не проблема для устройств, которые
+запитываются самостоятельно, от отдельного источника тока (питаются не от
+шины USB). Устройства, питающиеся от шины USB, могут выполнить это требование
+только в том случае, если CPU (в нашем случае микроконтроллер AVR) переходит
+в режим сна (sleep mode). Самостоятельно драйвер не поддерживает обработку
+режима suspend. Однако приложение может реализовать мониторинг активности
+и пробуждение от сна. Хост регулярно отправляет состояния SE0 для поддержания
+шины в активном состоянии. Эти состояния SE0 могут детектироваться при
+использовании сигнала D- в качестве источника прерывания. Задайте USB_COUNT_SOF
+в 1 и используйте глобальную переменную usbSofCount для проверки активности шины.
+Работа без мастера USB:
+Драйвер ведет себя нейтрально без подключения к мастеру USB, если D- читается
+как 1. Чтобы избежать фальшивых прерываний, мы рекомендуем на сигнал D+
+(прерывание) подключить резистор высокого сопротивления (например 1M) как
+pull-down ("нижний" резистор, подключенный между землей и D+) или pull-up
+("верхний" резистор, подключенный между шиной питания +3.3 В и D+).
+Если используются диоды Зенера (стабилитроны), используйте pull-down.
+Если D- становится статически в 0, драйвер может заблокировать подпрограмму
+прерывания.
+Время задержки обработки прерывания (Interrupt latency):
+Приложение должно удостовериться, что USB прерывание не запрещено для более чем
+25 циклов (это число для 12 МГц, для бОльшей тактовой частоты допустимо
+бОльшее количество циклов, что и называется latency). Это подразумевает, что
+все обработчики прерывания должны быть либо задекларированы как "INTERRUPT"
+вместо "SIGNAL" (см. "avr/signal.h") либо написаны на ассемблере с первой
+инструкцией "sei".
+Максимальная длительность прерывания / потребление циклов CPU:
+Драйвер обрабатывает все соединения USB внутри обработчика прерывания. Выход
+из обработчика прерывания не произойдет, пока не будет принято все USB-сообщение
+целиком и отправится подтверждение. Это будет сделано примерно за 1200 циклов на
+частоте 12 MHz (= 100us), если хост отвечает требованиям стандарта. Драйвер
+будет потреблять циклы CPU для всех сообщений USB, даже если они обращаются
+к другому (low-speed) устройству на той же шине.
+*/
+/* ------------------------------------------------------------------------- */
+/* --------------------------- Интерфейс модуля ---------------------------- */
+/* ------------------------------------------------------------------------- */
+#define USBDRV_VERSION 20080513
+/* Здесь задается уникальный идентификатор версии драйвера. Это десятичный номер,
+* составленный из даты релиза драйвера в форме YYYYMMDD. Если поведение интерфейса
+* драйвера меняется, Вы можете использовать эту константу, чтобы отличить версии.
+* Если не указано, то дата релиза драйвера старее чем 2006-01-25.
+*/
+#ifndef USB_PUBLIC
+#define USB_PUBLIC
+#endif
+/* USB_PUBLIC используется как атрибут декларации для всех функций, экспортируемых
+* драйвером USB. По умолчанию атрибут не задан (см. выше). Вы можете задать
+* атрибут static либо в usbconfig.h или из командной строки, если Вы включаете
+* usbdrv.c вместо его линковки. Включение модуля C драйвера напрямую в Ваш код
+* экономит несколько байт пямяти flash (память программ).
+*/
+#ifndef __ASSEMBLER__
+#ifndef uchar
+#define uchar unsigned char
+#endif
+#ifndef schar
+#define schar signed char
+#endif
+/* шорткаты 8 бит целых типов */
+#if USB_CFG_LONG_TRANSFERS /* если требуется для передачи больше, чем 254 байта */
+# define usbMsgLen_t unsigned
+#else
+# define usbMsgLen_t uchar
+#endif
+/* usbMsgLen_t определяет тип данных, используемый для длин передачи. По умолчанию
+* задано uchar, что позволяет передать максимум 254 байт (число 255 зарезервировано
+* для USB_NO_MSG далее). Если в файле usbconfig.h задано USB_CFG_LONG_TRANSFERS в 1,
+* будет использоваться тип данных 16 бит, что разрешает до 16384 байт (остаток
+* используется для флагов в конфигурации дескриптора).
+*/
+#define USB_NO_MSG ((usbMsgLen_t)-1) /* константа, которая означает "нет сообщения" */
+struct usbRequest; /* предварительная декларация */
+USB_PUBLIC void usbInit(void);
+/* Эта функция должна быть вызвана перед разрешением прерываний и заходом в основной
+* цикл main.
+*/
+USB_PUBLIC void usbPoll(void);
+/* Эта функция должна быть вызвана через регулярные интервалы внутри главного цикла main.
+* Максимальная задержка между вызовами должна быть несколько меньше 50 мс (таймаут USB для
+* принятия сообщения Setup). Иначе устройство не будет распознано.
+* Пожалуйста примите во внимание, что отладочный вывод через UART отнимает ~ 0.5 мс на байт
+* при скорости 19200 bps.
+*/
+extern uchar *usbMsgPtr;
+/* Эта переменная может использоваться для передачи отправляемых данных драйверу
+* от реализации usbFunctionWrite(). Она также используется внутренне драйвером
+* для стандартных управляющих запросов.
+*/
+USB_PUBLIC usbMsgLen_t usbFunctionSetup(uchar data[8]);
+/* Эта функция вызывается, когда драйвер принимает транзакцию SETUP от хоста,
+* которому не отвечает драйвер непосредственно (на практике: запросы класса
+* и вендора). Все управляющие передачи стартуют с транзакции SETUP, где хост
+* сообщает параметры следующтих (опционально) передач данных. Данные SETUP
+* доступны в параметре 'data', который может (и должен) быть преобразован
+* в 'usbRequest_t *' для лучшего дружественного для пользователя доступа
+* к параметрам.
+*
+* Если SETUP показывает передачу control-in, Вы должны обеспечить для драйвера
+* запрошенные данные. Есть два пути для передачи этих данных:
+* (1) установить глобальный указатель 'usbMsgPtr' на начало блока данных
+* static RAM и возвратить длину данных в 'usbFunctionSetup()'. Драйвер
+* обработает остаток. Или (2) возвратить USB_NO_MSG в 'usbFunctionSetup()'.
+* Драйвер будет вызывать 'usbFunctionRead()', когда понадобятся данные. Для
+* подробностей см. документацию usbFunctionRead().
+*
+* Если SETUP показывает передачу control-out, есть только один путь для приема
+* данных от хоста - через вызов 'usbFunctionWrite()'. Если Вы реализовали эту
+* функцию, Вы должны возвратить USB_NO_MSG в 'usbFunctionSetup()', чтобы
+* показать необходимость использования 'usbFunctionWrite()'. Для большей
+* информации см. документацию по этой функции. Если Вы просто хотите игнорировать
+* данные, отправленные хостом, верните 0 'usbFunctionSetup()'.
+*
+* Примите во внимание, что вызовы функций usbFunctionRead() и usbFunctionWrite()
+* работают только если они разрешены конфигурацией в usbconfig.h.
+*/
+USB_PUBLIC usbMsgLen_t usbFunctionDescriptor(struct usbRequest *rq);
+/* Вам нужно реализовать эту функцию ТОЛЬКО если Вы предоставляете дескрипторы USB
+* во время выполнения - runtime (особенность для экспертов). Это очень подобно
+* usbFunctionSetup() выше, но она вызывается только для запроса данных дескриптора
+* USB data. Подробнее см. документацию usbFunctionSetup() выше.
+*/
+#if USB_CFG_HAVE_INTRIN_ENDPOINT
+USB_PUBLIC void usbSetInterrupt(uchar *data, uchar len);
+/* Эта функция устанавливает сообщение, которое будет отправлено при следующей
+* передаче IN по прерыванию. Сообщение копируется во внутренний буфер и не должно
+* превышать по длине 8 байт. Сообщение может быть длиной в 0 байт просто для
+* индикации статуса прерывания для хоста.
+* Если Вам нужно передать бОльшее количество байт, используйте контрольное чтение
+* после прерывания.
+*/
+#define usbInterruptIsReady() (usbTxLen1 & 0x10)
+/* Этот макрос индицирует, было ли ужет послано последнее сообщение прерывания.
+* Если Вы установили новое сообщение прерывания перед тем, как старое было
+* отправлено, то уже буферизированое сообщение будет потеряно.
+*/
+#if USB_CFG_HAVE_INTRIN_ENDPOINT3
+USB_PUBLIC void usbSetInterrupt3(uchar *data, uchar len);
+#define usbInterruptIsReady3() (usbTxLen3 & 0x10)
+/* То же самое, как ранее, но для конечной точки 3 */
+#endif
+#endif /* USB_CFG_HAVE_INTRIN_ENDPOINT */
+#if USB_CFG_HID_REPORT_DESCRIPTOR_LENGTH /* упрощенный интерфейс для обратной совместимости */
+#define usbHidReportDescriptor usbDescriptorHidReport
+/* должен быть декларирован так: PROGMEM char usbHidReportDescriptor[]; */
+/* Если Вы реализуете устройство HID, Вам нужно предоставить дескриптор репорта.
+* HID репорт дескриптор имеет несколько усложненный синтаксис. Если Вы понимаете,
+* как конструировать репорт дескрипторы, мы рекомендуем использовать
+* HID Descriptor Tool от usb.org, см. http://www.usb.org/developers/hidpage/.
+* В другом случае Вам нужно начать с рабочего примера.
+*/
+#endif /* USB_CFG_HID_REPORT_DESCRIPTOR_LENGTH */
+#if USB_CFG_IMPLEMENT_FN_WRITE
+USB_PUBLIC uchar usbFunctionWrite(uchar *data, uchar len);
+/* Эта функция вызывается драйвером для обеспечения управляющих передач
+* (control transfer's) данных полезной нагрузки (control-out). Она вызывается
+* в кусках до 8 байт. Общее количество, предоставляемое в текущей управляющей
+* передаче, может быть получено из свойства 'length' данных setup. Если
+* во время обработки произошла ошибка, возвращается 0xff (== -1). В этом
+* случае драйвер будет отвечать для всей передачи токеном STALL. Если Вы
+* успешно приняли всю полезную нагрузку, возвращается 1. Если Вы ожидаете
+* больше данных, возврат 0. Если Вы не знаете, будет ли хост посылать еще
+* данные (Вы должны знать общее количество предоставляется вызовом
+* usbFunctionSetup()!), возвращается 1.
+* ЗАМЕЧАНИЕ: Если Вы вернули 0xff для STALL, 'usbFunctionWrite()' будет все
+* равно вызываться для оставшихся данных. Вы должны продолжить возвращать 0xff
+* для STALL в этих вызовах.
+* Для того, чтобы добиться вызовов usbFunctionWrite(), задайте
+* USB_CFG_IMPLEMENT_FN_WRITE на 1 в usbconfig.h и возвратите 0xff в usbFunctionSetup().
+*/
+#endif /* USB_CFG_IMPLEMENT_FN_WRITE */
+#if USB_CFG_IMPLEMENT_FN_READ
+USB_PUBLIC uchar usbFunctionRead(uchar *data, uchar len);
+/* Эта функция вызывается драйвером для запроса у приложения управляющих передач
+* данных полезной нагрузки (control-in). Вызывается кусками до 8 байт каждый.
+* Вы должны скопировать данные в место, указанное параметром 'data' и
+* возвратить действительно скопированное количество байт. Если Вы вернете return
+* число меньшее, чем запрашивается, передача control-in будет прервана. Если
+* Вы возвратите 0xff, драйвер прервет передачу с токеном STALL.
+* Для того, чтобы вызывалась usbFunctionRead(), задайте USB_CFG_IMPLEMENT_FN_READ
+* на 1 в usbconfig.h и верните 0xff в usbFunctionSetup().
+*/
+#endif /* USB_CFG_IMPLEMENT_FN_READ */
+#if USB_CFG_IMPLEMENT_FN_WRITEOUT
+USB_PUBLIC void usbFunctionWriteOut(uchar *data, uchar len);
+/* Эта функция вызывается драйвером когда данные принимаются конечной точкой
+* interrupt или bulk-out. Номер конечной точки можно найти в глобальной
+* переменной usbRxToken. Вы должны задать USB_CFG_IMPLEMENT_FN_WRITEOUT на 1
+* в usbconfig.h, чтобы добиться вызова этой функции.
+*/
+#endif /* USB_CFG_IMPLEMENT_FN_WRITEOUT */
+#ifdef USB_CFG_PULLUP_IOPORTNAME
+#define usbDeviceConnect() ((USB_PULLUP_DDR |= (1<<USB_CFG_PULLUP_BIT)), \
+(USB_PULLUP_OUT |= (1<<USB_CFG_PULLUP_BIT)))
+#define usbDeviceDisconnect() ((USB_PULLUP_DDR &= ~(1<<USB_CFG_PULLUP_BIT)), \
+(USB_PULLUP_OUT &= ~(1<<USB_CFG_PULLUP_BIT)))
+#else /* USB_CFG_PULLUP_IOPORTNAME */
+#define usbDeviceConnect() (USBDDR &= ~(1<<USBMINUS))
+#define usbDeviceDisconnect() (USBDDR |= (1<<USBMINUS))
+#endif /* USB_CFG_PULLUP_IOPORTNAME */
+/* Макрос usbDeviceConnect() и usbDeviceDisconnect() (предназначенный напоминать
+* функцию) соединяет и соединяет устройство с шиной USB хоста. Если константы
+* USB_CFG_PULLUP_IOPORT и USB_CFG_PULLUP_BIT заданы в usbconfig.h, отсоединение
+* заключается в удалении резистора pull-up от D-, иначе отсоединение происходит
+* при грубом притягивании D- к GND (D- программно устанавливается как выход 0).
+* Это не удовлетворяет спецификации, но работает.
+* Пожалуйста примите во внимание, что прерывание USB должно быть запрещено,
+* когда устройство переходит в отключенное состояние, или обработчик прерывания
+* зависнет! Вы можете либо выключить прерывание USB селективно:
+* USB_INTR_ENABLE &= ~(1 << USB_INTR_ENABLE_BIT)
+* или выполнить cli() для глобального запрета всех прерываний.
+*/
+extern unsigned usbCrc16(unsigned data, uchar len);
+#define usbCrc16(data, len) usbCrc16((unsigned)(data), len)
+/* Эта функция вычисляет двоичное дополнение CRC данных, используемое в пакетах
+* данных USB. Величина используется для постороения сырых (raw) передаваемых
+* пакетов. Вы можете пожелать использовать эту функцию для контрольных сумм
+* данных или проверки принятых данных. Мы принудительно установили 16 бит
+* соглашение о вызовах для совместимости с tiny моделью памяти IAR.
+*/
+extern unsigned usbCrc16Append(unsigned data, uchar len);
+#define usbCrc16Append(data, len) usbCrc16Append((unsigned)(data), len)
+/* Эта функция вычисляет эквивалентна usbCrc16() выше, отличие только в том,
+* что она добавляет 2 байта CRC (первым младший байт) в буфер 'data' после
+* чтения 'len' байт.
+*/
+#if USB_CFG_HAVE_MEASURE_FRAME_LENGTH
+extern unsigned usbMeasureFrameLength(void);
+/* Эта функция ДОЛЖНА быть вызвана НЕМЕДЛЕННО СРАЗУ ПОСЛЕ сброса USB и она
+* измеряет 1/7 количества циклов CPU во время фрейма USB минус один бит длины
+* низкоскоростного бита. Другими словами: возвращаемая величина
+* = 1499 * (F_CPU / 10.5 MHz).
+* Во время этого активного ожидания, Вы ДОЛЖНЫ запретить все прерывания,
+* используя cli() перед вызовом этой функции. Функция может использоваться
+* для калибровки RC-генератора AVR.
+*/
+#endif
+extern uchar usbConfiguration;
+/* Эта переменная содержит номер текущей конфигурации, установленной хостом.
+* Драйвер позволяет установку и опрос этой переменной с запросами USB
+* SET_CONFIGURATION и GET_CONFIGURATION, но не использует её иначе.
+* Вы можете отразить "сконфигурированное" состояние светодиодом (LED)
+* на устройстве или включить узлы схемы, потребляющие большую мощность,
+* только если устройство сконфигурировано.
+*/
+#if USB_COUNT_SOF
+extern volatile uchar usbSofCount;
+/* Эта переременная инкрементируется каждым пакетом SOF (Start-Of-Frame, начало
+* фрейма). Это доступно только в том случае, если макро USB_COUNT_SOF задан
+* в величину != 0.
+*/
+#endif
+#define USB_STRING_DESCRIPTOR_HEADER(stringLength) ((2*(stringLength)+2) | (3<<8))
+/* Этот макро строит заголовок дескриптора для строкового дескриптора,
+* по указанной длине строки. См. для примера использования usbdrv.c.
+*/
+#if USB_CFG_HAVE_FLOWCONTROL
+extern volatile schar usbRxLen;
+#define usbDisableAllRequests() usbRxLen = -1
+/* Должно быть вызвано из usbFunctionWrite(). Этот макрос запрещает все входные
+* данные от интерфейса USB. На запросы от хоста посылаются ответы NAK, пока
+* действует такой запрет.
+*/
+#define usbEnableAllRequests() usbRxLen = 0
+/* Может быть вызвано только если запросы запрещены. Этот макрос разрешает ввод
+* от интерфейса USB после того, как он был запрещен вызовом usbDisableAllRequests().
+*/
+#define usbAllRequestsAreDisabled() (usbRxLen < 0)
+/* Этот макрос возвращает TRUE, если запросы были запрещены. Он может понадобиться
+* для того, чтобы убедиться в том, что usbEnableAllRequests() не вызывалась,
+* когда запросы разрешены.
+*/
+#endif
+#define USB_SET_DATATOKEN1(token) usbTxBuf1[0] = token
+#define USB_SET_DATATOKEN3(token) usbTxBuf3[0] = token
+/* Эти два макроса могут использоваться программой приложения для сброса переключения
+* данных для конечных точек interrupt-in с номерами 1 и 3. Поскольку токен
+* переключается ПЕРЕД отправкой данных, Вы должны установить противоположное
+* значение токена, который должен прийти первым.
+*/
+#endif /* __ASSEMBLER__ */
+/* ------------------------------------------------------------------------- */
+/* -------------------- Определение свойств дескриптора -------------------- */
+/* ------------------------------------------------------------------------- */
+/* Это особенный материал. См. usbconfig-prototype.h для подробностей
+* о различных методах определения дескрипторов USB. Если Вы ничего не сделаете,
+* будут использоваться дескрипторы по умолчанию.
+*/
+#define USB_PROP_IS_DYNAMIC (1 << 14)
+/* Если это свойство установлено для дескриптора, usbFunctionDescriptor() будет
+* использоваться для получения частного дескриптора.
+*/
+#define USB_PROP_IS_RAM (1 << 15)
+/* Если это свойство установлено для дескриптора, данные читаются из памяти RAM
+* вместо Flash. Свойство используется всеми методами для предоставления
+* внешних дескрипторов.
+*/
+#define USB_PROP_LENGTH(len) ((len) & 0x3fff)
+/* Если используется статический внешний дескриптор, это общая длина дескриптора
+* в байтах.
+*/
+/* все дескрипторы, которые могут иметь свойства: */
+#ifndef USB_CFG_DESCR_PROPS_DEVICE
+#define USB_CFG_DESCR_PROPS_DEVICE 0
+#endif
+#ifndef USB_CFG_DESCR_PROPS_CONFIGURATION
+#define USB_CFG_DESCR_PROPS_CONFIGURATION 0
+#endif
+#ifndef USB_CFG_DESCR_PROPS_STRINGS
+#define USB_CFG_DESCR_PROPS_STRINGS 0
+#endif
+#ifndef USB_CFG_DESCR_PROPS_STRING_0
+#define USB_CFG_DESCR_PROPS_STRING_0 0
+#endif
+#ifndef USB_CFG_DESCR_PROPS_STRING_VENDOR
+#define USB_CFG_DESCR_PROPS_STRING_VENDOR 0
+#endif
+#ifndef USB_CFG_DESCR_PROPS_STRING_PRODUCT
+#define USB_CFG_DESCR_PROPS_STRING_PRODUCT 0
+#endif
+#ifndef USB_CFG_DESCR_PROPS_STRING_SERIAL_NUMBER
+#define USB_CFG_DESCR_PROPS_STRING_SERIAL_NUMBER 0
+#endif
+#ifndef USB_CFG_DESCR_PROPS_HID
+#define USB_CFG_DESCR_PROPS_HID 0
+#endif
+#if !(USB_CFG_DESCR_PROPS_HID_REPORT)
+# undef USB_CFG_DESCR_PROPS_HID_REPORT
+# if USB_CFG_HID_REPORT_DESCRIPTOR_LENGTH /* некоторые ухищрения для обратной совместимости */
+# define USB_CFG_DESCR_PROPS_HID_REPORT USB_CFG_HID_REPORT_DESCRIPTOR_LENGTH
+# else
+# define USB_CFG_DESCR_PROPS_HID_REPORT 0
+# endif
+#endif
+#ifndef USB_CFG_DESCR_PROPS_UNKNOWN
+#define USB_CFG_DESCR_PROPS_UNKNOWN 0
+#endif
+/* ------------------ предварительная декларация дескрипторов ------------------- */
+/* Если Вы используете внешние статические дескрипторы, они должны быть запомнены
+* в глобальных массивах, как объявлено ниже:
+*/
+#ifndef __ASSEMBLER__
+extern
+#if !(USB_CFG_DESCR_PROPS_DEVICE & USB_PROP_IS_RAM)
+PROGMEM
+#endif
+char usbDescriptorDevice[];
+extern
+#if !(USB_CFG_DESCR_PROPS_CONFIGURATION & USB_PROP_IS_RAM)
+PROGMEM
+#endif
+char usbDescriptorConfiguration[];
+extern
+#if !(USB_CFG_DESCR_PROPS_HID_REPORT & USB_PROP_IS_RAM)
+PROGMEM
+#endif
+char usbDescriptorHidReport[];
+extern
+#if !(USB_CFG_DESCR_PROPS_STRING_0 & USB_PROP_IS_RAM)
+PROGMEM
+#endif
+char usbDescriptorString0[];
+extern
+#if !(USB_CFG_DESCR_PROPS_STRING_VENDOR & USB_PROP_IS_RAM)
+PROGMEM
+#endif
+int usbDescriptorStringVendor[];
+extern
+#if !(USB_CFG_DESCR_PROPS_STRING_PRODUCT & USB_PROP_IS_RAM)
+PROGMEM
+#endif
+int usbDescriptorStringDevice[];
+extern
+#if !(USB_CFG_DESCR_PROPS_STRING_SERIAL_NUMBER & USB_PROP_IS_RAM)
+PROGMEM
+#endif
+int usbDescriptorStringSerialNumber[];
+#endif /* __ASSEMBLER__ */
+/* ------------------------------------------------------------------------- */
+/* ----------------------- Макросы общего назначения ----------------------- */
+/* ------------------------------------------------------------------------- */
+#define USB_CONCAT(a, b) a ## b
+#define USB_CONCAT_EXPANDED(a, b) USB_CONCAT(a, b)
+#define USB_OUTPORT(name) USB_CONCAT(PORT, name)
+#define USB_INPORT(name) USB_CONCAT(PIN, name)
+#define USB_DDRPORT(name) USB_CONCAT(DDR, name)
+/* Метод, заданный дважды выше позволяет нам сращивать строки, заданные макросом.
+*/
+/* ------------------------------------------------------------------------- */
+/* ------------------------- Определения констант -------------------------- */
+/* ------------------------------------------------------------------------- */
+#if !defined __ASSEMBLER__ && (!defined USB_CFG_VENDOR_ID || !defined USB_CFG_DEVICE_ID)
+#warning "You should define USB_CFG_VENDOR_ID and USB_CFG_DEVICE_ID in usbconfig.h"
+/* Если пользователь не задал идентификаторы ID, мы используем по умолчанию
+* свободные obdev ID. Детали см. в USBID-License.txt.
+*/
+#endif
+/* убедитесь, что мы имеем заданные VID и PID, порядок байт младший байт (lowbyte),
+старший байт (highbyte) */
+#ifndef USB_CFG_VENDOR_ID
+# define USB_CFG_VENDOR_ID 0xc0, 0x16 /* 5824 десятичное, используется для VOTI */
+#endif
+#ifndef USB_CFG_DEVICE_ID
+# if USB_CFG_HID_REPORT_DESCRIPTOR_LENGTH
+# define USB_CFG_DEVICE_ID 0xdf, 0x05 /* 1503 десятичное, предоставленный в общий доступ PID для HID-ов */
+# elif USB_CFG_INTERFACE_CLASS == 2
+# define USB_CFG_DEVICE_ID 0xe1, 0x05 /* 1505 десятичное, предоставленный в общий доступ PID для модемов CDC */
+# else
+# define USB_CFG_DEVICE_ID 0xdc, 0x05 /* 1500 десятичное, свободный obdev PID */
+# endif
+#endif
+/* Наследование Output, Input и DataDirection порты от имен портов */
+#ifndef USB_CFG_IOPORTNAME
+#error "You must define USB_CFG_IOPORTNAME in usbconfig.h, see usbconfig-prototype.h"
+#endif
+#define USBOUT USB_OUTPORT(USB_CFG_IOPORTNAME)
+#define USB_PULLUP_OUT USB_OUTPORT(USB_CFG_PULLUP_IOPORTNAME)
+#define USBIN USB_INPORT(USB_CFG_IOPORTNAME)
+#define USBDDR USB_DDRPORT(USB_CFG_IOPORTNAME)
+#define USB_PULLUP_DDR USB_DDRPORT(USB_CFG_PULLUP_IOPORTNAME)
+#define USBMINUS USB_CFG_DMINUS_BIT
+#define USBPLUS USB_CFG_DPLUS_BIT
+#define USBIDLE (1<<USB_CFG_DMINUS_BIT) /* величина, представляющая состояние J */
+#define USBMASK ((1<<USB_CFG_DPLUS_BIT) | (1<<USB_CFG_DMINUS_BIT)) /* маска для USB битов I/O */
+/* определения для обратной совместимости со старыми версиями драйвера: */
+#define USB_CFG_IOPORT USB_OUTPORT(USB_CFG_IOPORTNAME)
+#ifdef USB_CFG_PULLUP_IOPORTNAME
+#define USB_CFG_PULLUP_IOPORT USB_OUTPORT(USB_CFG_PULLUP_IOPORTNAME)
+#endif
+#ifndef USB_CFG_EP3_NUMBER /* если не задано в usbconfig.h */
+#define USB_CFG_EP3_NUMBER 3
+#endif
+#define USB_BUFSIZE 11 /* PID, 8 байт данных, 2 байта CRC */
+/* ----- Попытка найти регистры и биты, отвечающие за внешнее прерывание 0 ----- */
+#ifndef USB_INTR_CFG /* пользователь может перезадать наши умолчания */
+# if defined EICRA
+# define USB_INTR_CFG EICRA
+# else
+# define USB_INTR_CFG MCUCR
+# endif
+#endif
+#ifndef USB_INTR_CFG_SET /* пользователь может перезадать наши значения по умолчанию */
+# define USB_INTR_CFG_SET ((1 << ISC00) | (1 << ISC01)) /* конфигурируем на фронт (нарастание) сигнала */
+#endif
+#ifndef USB_INTR_CFG_CLR /* пользователь может перезадать наши значения по умолчанию */
+# define USB_INTR_CFG_CLR 0 /* нет битов для очистки */
+#endif
+#ifndef USB_INTR_ENABLE /* пользователь может перезадать наши значения по умолчанию */
+# if defined GIMSK
+# define USB_INTR_ENABLE GIMSK
+# elif defined EIMSK
+# define USB_INTR_ENABLE EIMSK
+# else
+# define USB_INTR_ENABLE GICR
+# endif
+#endif
+#ifndef USB_INTR_ENABLE_BIT /* пользователь может перезадать наши значения по умолчанию */
+# define USB_INTR_ENABLE_BIT INT0
+#endif
+#ifndef USB_INTR_PENDING /* пользователь может перезадать наши значения по умолчанию */
+# if defined EIFR
+# define USB_INTR_PENDING EIFR
+# else
+# define USB_INTR_PENDING GIFR
+# endif
+#endif
+#ifndef USB_INTR_PENDING_BIT /* пользователь может перезадать наши значения по умолчанию */
+# define USB_INTR_PENDING_BIT INTF0
+#endif
+/*
+Определения выше не работают для следующих чипов:
+at90c8534: нет ISC0?, нет PORTB, невозможно найти даташит
+at86rf401: нет PORTB, нет MCUCR и т. д., низкая частота тактов
+atmega103: нет ISC0? (может быть пропущено в заголовке, невозможно найти даташит)
+atmega603: не задано в avr-libc
+at43usb320, at43usb355, at76c711: уже имеется USB
+at94k: это другой тип...
+at90s1200, attiny11, attiny12, attiny15, attiny28: эти микроконтроллеры не имеют RAM
+*/
+/* ------------------------------------------------------------------------- */
+/* ------------------- Константы и типы спецификации USB ------------------- */
+/* ------------------------------------------------------------------------- */
+/* значения токенов USB */
+#define USBPID_SETUP 0x2d
+#define USBPID_OUT 0xe1
+#define USBPID_IN 0x69
+#define USBPID_DATA0 0xc3
+#define USBPID_DATA1 0x4b
+#define USBPID_ACK 0xd2
+#define USBPID_NAK 0x5a
+#define USBPID_STALL 0x1e
+#ifndef USB_INITIAL_DATATOKEN
+#define USB_INITIAL_DATATOKEN USBPID_DATA1
+#endif
+#ifndef __ASSEMBLER__
+typedef struct usbTxStatus{
+volatile uchar len;
+uchar buffer[USB_BUFSIZE];
+}usbTxStatus_t;
+extern usbTxStatus_t usbTxStatus1, usbTxStatus3;
+#define usbTxLen1 usbTxStatus1.len
+#define usbTxBuf1 usbTxStatus1.buffer
+#define usbTxLen3 usbTxStatus3.len
+#define usbTxBuf3 usbTxStatus3.buffer
+typedef union usbWord{
+unsigned word;
+uchar bytes[2];
+}usbWord_t;
+typedef struct usbRequest{
+uchar bmRequestType;
+uchar bRequest;
+usbWord_t wValue;
+usbWord_t wIndex;
+usbWord_t wLength;
+}usbRequest_t;
+/* Эта структура соответствует 8-байтному запросу setup */
+#endif
+/* поле bmRequestType в USB setup:
+* d t t r r r r r, где
+* d ..... направление: 0=хост->устройство, 1=устройство->хост
+* t ..... тип: 0=стандартный, 1=класс, 2=вендор, 3=зарезервировано
+* r ..... получатель: 0=устройство, 1=интерфейс, 2=конечная точка, 3=другое
+*/
+/* Значения получателя USB setup */
+#define USBRQ_RCPT_MASK 0x1f
+#define USBRQ_RCPT_DEVICE 0
+#define USBRQ_RCPT_INTERFACE 1
+#define USBRQ_RCPT_ENDPOINT 2
+/* Значения типа запроса USB */
+#define USBRQ_TYPE_MASK 0x60
+#define USBRQ_TYPE_STANDARD (0<<5)
+#define USBRQ_TYPE_CLASS (1<<5)
+#define USBRQ_TYPE_VENDOR (2<<5)
+/* Значения направления USB: */
+#define USBRQ_DIR_MASK 0x80
+#define USBRQ_DIR_HOST_TO_DEVICE (0<<7)
+#define USBRQ_DIR_DEVICE_TO_HOST (1<<7)
+/* Стандартные запросы USB */
+#define USBRQ_GET_STATUS 0
+#define USBRQ_CLEAR_FEATURE 1
+#define USBRQ_SET_FEATURE 3
+#define USBRQ_SET_ADDRESS 5
+#define USBRQ_GET_DESCRIPTOR 6
+#define USBRQ_SET_DESCRIPTOR 7
+#define USBRQ_GET_CONFIGURATION 8
+#define USBRQ_SET_CONFIGURATION 9
+#define USBRQ_GET_INTERFACE 10
+#define USBRQ_SET_INTERFACE 11
+#define USBRQ_SYNCH_FRAME 12
+/* Константы дескриптора USB */
+#define USBDESCR_DEVICE 1
+#define USBDESCR_CONFIG 2
+#define USBDESCR_STRING 3
+#define USBDESCR_INTERFACE 4
+#define USBDESCR_ENDPOINT 5
+#define USBDESCR_HID 0x21
+#define USBDESCR_HID_REPORT 0x22
+#define USBDESCR_HID_PHYS 0x23
+#define USBATTR_BUSPOWER 0x80
+#define USBATTR_SELFPOWER 0x40
+#define USBATTR_REMOTEWAKE 0x20
+/* Запросы USB HID */
+#define USBRQ_HID_GET_REPORT 0x01
+#define USBRQ_HID_GET_IDLE 0x02
+#define USBRQ_HID_GET_PROTOCOL 0x03
+#define USBRQ_HID_SET_REPORT 0x09
+#define USBRQ_HID_SET_IDLE 0x0a
+#define USBRQ_HID_SET_PROTOCOL 0x0b
+/* ------------------------------------------------------------------------- */
+#endif /* __usbdrv_h_included__ */ 
